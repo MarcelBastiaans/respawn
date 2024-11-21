@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <string.h>
+#include <time.h>
 #include <linux/limits.h>
 #include <errno.h>
 
@@ -15,6 +16,8 @@ pid_t child_pid = -1;
 volatile sig_atomic_t terminate = 0;
 char *program_name;
 char **program_args;
+char *pid_file = NULL;
+int respawn_delay_ms = 0;
 
 
 void print_program() {
@@ -25,6 +28,23 @@ void print_program() {
     printf("\n");
 }
 
+void write_pid_file() {
+    if (pid_file) {
+        FILE *file = fopen(pid_file, "w");
+        if (file) {
+            fprintf(file, "%d\n", getpid());
+            fclose(file);
+        } else {
+            perror("fopen");
+        }
+    }
+}
+
+void remove_pid_file() {
+    if (pid_file) {
+        unlink(pid_file);
+    }
+}
 
 void start_child_process() {
     child_pid = fork();
@@ -33,7 +53,7 @@ void start_child_process() {
         exit(EXIT_FAILURE);
     } else if (child_pid == 0) {
         // Child process
-        //print_program();
+        print_program();
         execv(program_name, program_args);
         perror("execve failed");
         exit(EXIT_FAILURE);
@@ -50,8 +70,21 @@ void sigchld_handler(int sig) {
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
             if (terminate) {
                 printf("Child process %d terminated, exiting...\n", pid);
+                remove_pid_file();
                 exit(EXIT_SUCCESS);
             } else {
+                printf("Child process %d terminated, sleeping...\n", pid);
+                if (respawn_delay_ms > 0) {
+                    struct timespec ts;
+                    ts.tv_sec = respawn_delay_ms / 1000;
+                    ts.tv_nsec = (respawn_delay_ms % 1000) * 1000000;
+                    nanosleep(&ts, NULL);
+                }
+                if (terminate) {
+                    printf("Child process %d terminated, exiting...\n", pid);
+                    remove_pid_file();
+                    exit(EXIT_SUCCESS);
+                }
                 printf("Child process %d terminated, restarting...\n", pid);
                 start_child_process();
             }
@@ -62,6 +95,7 @@ void sigchld_handler(int sig) {
 void forward_signal(int sig) {
     terminate = 1;
     if (child_pid > 0) {
+        printf("Killing child process %d wth signal %d\n", child_pid, sig);
         kill(child_pid, sig);
     }
 }
@@ -116,19 +150,52 @@ char* find_program_in_path(const char *program) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
+void print_usage(const char* program_name)
+{
+    fprintf(stderr, "Usage: %s [--pidfile <file>] [--delay <milliseconds>] -- <program> [args...]\n", program_name);
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char *argv[]) 
+{
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <program> [args...]\n", argv[0]);
-        exit(EXIT_FAILURE);
+        print_usage(argv[0]);
     }
 
-    program_name = find_program_in_path(argv[1]);
+    int i;
+    for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--pidfile") == 0) {
+            if (i + 1 < argc) {
+                pid_file = argv[++i];
+            } else {
+                print_usage(argv[0]);
+            }
+        } else if (strcmp(argv[i], "--delay") == 0) {
+            if (i + 1 < argc) {
+                respawn_delay_ms = atoi(argv[++i]);
+            } else {
+                print_usage(argv[0]);
+            } 
+        } else if (strcmp(argv[i], "--") == 0) {
+            ++i;
+            break;
+        }
+    }
+
+    if (i >= argc) {
+        print_usage(argv[0]);
+    }
+
+    program_name = find_program_in_path(argv[i]);
     if (!program_name) {
-        fprintf(stderr, "Program %s not found in PATH\n", argv[1]);
+        fprintf(stderr, "Program %s not found in PATH\n", argv[i]);
         exit(EXIT_FAILURE);
     }
-    program_args = &argv[1];
+    program_args = &argv[i];
     program_args[0] = program_name; // Update argv[0] to the full path
+
+    // Create the PID file
+    write_pid_file();
 
     // Set up signal handlers
     setup_signal_handlers();
